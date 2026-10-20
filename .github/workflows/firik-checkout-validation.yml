@@ -1,0 +1,92 @@
+name: Firik PayPal checkout regression validation
+on:
+  push:
+    branches: [ci/firik-checkout-validation]
+permissions:
+  contents: read
+jobs:
+  checkout-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 2
+      - uses: ddev/github-action-setup-ddev@1c7ef18595da42355373cb6d9417a6f44d758b93
+        with:
+          autostart: false
+      - name: Start isolated DDEV
+        run: ddev start
+      - name: Install project dependencies
+        run: |
+          ddev composer install --no-interaction
+          # The private Playwright helper is not used by Jest or the plugin build.
+          # Adjust only this disposable runner's manifests; never the PR branch.
+          ddev exec node -e '
+            const fs = require("fs");
+            for (const file of ["package.json", "package-lock.json"]) {
+              const data = JSON.parse(fs.readFileSync(file, "utf8"));
+              const root = file === "package.json" ? data : data.packages[""];
+              delete root.devDependencies["@inpsyde/playwright-utils"];
+              if (data.packages) {
+                for (const key of Object.keys(data.packages)) {
+                  if (key.startsWith("node_modules/@inpsyde/playwright-utils")) {
+                    delete data.packages[key];
+                  }
+                }
+              }
+              fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+            }
+          '
+          ddev npm ci
+      - name: Check JavaScript coding standards
+        id: lint
+        continue-on-error: true
+        run: ddev npx wp-scripts lint-js modules/ppcp-button/resources/js/modules/ActionHandler/CheckoutActionHandler.test.js
+      - name: Prove regression tests fail on the unpatched source
+        run: |
+          source=modules/ppcp-button/resources/js/modules/ActionHandler/CheckoutActionHandler.js
+          cp "$source" /tmp/patched-checkout.js
+          git show HEAD^:"$source" > "$source"
+          set +e
+          ddev npm run test:unit-js -- --runInBand --watch=false --runTestsByPath modules/ppcp-button/resources/js/modules/ActionHandler/CheckoutActionHandler.test.js 2>&1 | tee /tmp/paypal-baseline.log
+          result=${PIPESTATUS[0]}
+          set -e
+          cp /tmp/patched-checkout.js "$source"
+          test "$result" -ne 0
+          grep -q 'clears corrected validation notices' /tmp/paypal-baseline.log
+      - name: Test the corrected checkout notices
+        run: |
+          set -o pipefail
+          ddev npm run test:unit-js -- --runInBand --watch=false --runTestsByPath modules/ppcp-button/resources/js/modules/ActionHandler/CheckoutActionHandler.test.js 2>&1 | tee /tmp/paypal-targeted.log
+      - name: Run all JavaScript unit tests
+        id: js
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          ddev npm run test:unit-js -- --runInBand --watch=false 2>&1 | tee /tmp/paypal-patched.log
+      - name: Build frontend assets
+        run: ddev npm run build
+      - name: Set up isolated WordPress and WooCommerce
+        run: ddev orchestrate
+      - name: Run PHP unit and checkout integration tests
+        id: php
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          ddev npm run test 2>&1 | tee /tmp/paypal-php-tests.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: paypal-regression-evidence
+          path: /tmp/paypal-*.log
+      - name: Require all checks to pass
+        if: always()
+        env:
+          LINT_RESULT: ${{ steps.lint.outcome }}
+          JS_RESULT: ${{ steps.js.outcome }}
+          PHP_RESULT: ${{ steps.php.outcome }}
+        run: |
+          test "$LINT_RESULT" = success
+          test "$JS_RESULT" = success
+          test "$PHP_RESULT" = success
